@@ -1,0 +1,14 @@
+{
+  "name": "lark-bot",
+  "version": "1.0.0",
+  "description": "Feishu bot powered by Claude AI",
+  "main": "bot-server.js",
+  "scripts": {
+    "start": "node bot-server.js",
+    "dev": "node --watch bot-server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "dotenv": "^16.0.0"
+  }
+}

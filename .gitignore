@@ -1,0 +1,9 @@
+node_modules/
+.env
+market-intel-db.json
+old-base-snapshot.json
+.last-seen-time
+tmp_images/
+deploy_key
+deploy_key.pub
+*.tar.gz

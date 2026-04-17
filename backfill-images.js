@@ -219,38 +219,109 @@ function uploadToBase(recordId, imagePath) {
 // Step 6: Match message to Base record
 // ─────────────────────────────────────────────
 
-function findMatchingRecord(msg, baseRecords) {
-  // Try to match by raw text content
-  const content = msg.body?.content || '';
+/**
+ * Extract ALL text from a Feishu message, handling text/post/image types.
+ */
+function extractMessageText(msg) {
+  const contentStr = msg.body?.content || msg.content || '';
+  const msgType = msg.msg_type || msg.message_type || '';
+
   let text = '';
   try {
-    const parsed = JSON.parse(content);
-    text = parsed.text || '';
+    const parsed = JSON.parse(contentStr);
+
+    if (parsed.text) {
+      // Simple text message: {"text": "..."}
+      text = parsed.text;
+    }
+    if (parsed.content) {
+      // Post message: {"title":"...","content":[[{"tag":"text","text":"..."},...]]}
+      if (Array.isArray(parsed.content)) {
+        for (const line of parsed.content) {
+          if (Array.isArray(line)) {
+            for (const el of line) {
+              if (el.tag === 'text' && el.text) text += el.text + ' ';
+              if (el.tag === 'a' && el.text) text += el.text + ' ';
+            }
+          }
+        }
+      }
+    }
+    if (parsed.title) text = parsed.title + ' ' + text;
   } catch {
-    text = content;
+    text = contentStr;
   }
 
-  if (!text || text.length < 5) text = '(图片消息)';
+  return text.replace(/\s+/g, ' ').trim();
+}
 
-  // Match by text prefix overlap with 原文 field
-  const textPrefix = text.replace(/\s+/g, '').slice(0, 20);
+function findMatchingRecord(msg, baseRecords) {
+  const text = extractMessageText(msg);
+  const cleanText = text.replace(/\s+/g, '').toLowerCase();
 
-  for (const rec of baseRecords) {
-    const recText = (rec.rawText || '').replace(/\s+/g, '').slice(0, 20);
-    if (textPrefix && recText && textPrefix === recText) {
-      return rec;
+  // Strategy 1: Match by rawText prefix (exact)
+  if (cleanText.length >= 10) {
+    const prefix20 = cleanText.slice(0, 20);
+    for (const rec of baseRecords) {
+      if (rec.hasImage) continue;
+      const recClean = (rec.rawText || '').replace(/\s+/g, '').toLowerCase();
+      if (recClean.length >= 10 && recClean.slice(0, 20) === prefix20) return rec;
     }
   }
 
-  // Fuzzy match: first 10 chars
-  const short = textPrefix.slice(0, 10);
-  if (short.length >= 5) {
+  // Strategy 2: Match by rawText containing message text (or vice versa)
+  if (cleanText.length >= 8) {
+    const snippet = cleanText.slice(0, 15);
     for (const rec of baseRecords) {
-      const recShort = (rec.rawText || '').replace(/\s+/g, '').slice(0, 10);
-      if (recShort && short === recShort) {
+      if (rec.hasImage) continue;
+      const recClean = (rec.rawText || '').replace(/\s+/g, '').toLowerCase();
+      if (recClean.includes(snippet) || (snippet.length >= 10 && cleanText.includes(recClean.slice(0, 15)))) {
         return rec;
       }
     }
+  }
+
+  // Strategy 3: Match by summary keywords overlap
+  if (cleanText.length >= 5) {
+    // Extract brand-like words from message
+    const brands = ['KEX','SPX','J&T','DHL','BEST','EMS','Flash',
+      'MySave','Shippop','ShipSmile','GoShip','ShipHub','iShip',
+      'DPlus','SuperShip','Postway','WeFast','SmallWin',
+      'Order Plus','Point Express','Me2Plus','Quick Service'];
+    const msgBrand = brands.find(b => text.toLowerCase().includes(b.toLowerCase()));
+    if (msgBrand) {
+      // Find a record with same brand, no image, closest by time
+      const candidates = baseRecords.filter(r =>
+        !r.hasImage && r.brand && r.brand.toLowerCase().includes(msgBrand.toLowerCase())
+      );
+      if (candidates.length === 1) return candidates[0];
+      // If multiple, try narrowing by summary content overlap
+      if (candidates.length > 1 && cleanText.length >= 10) {
+        for (const rec of candidates) {
+          const sumClean = (rec.summary || '').replace(/\s+/g, '').toLowerCase();
+          if (sumClean && cleanText.includes(sumClean.slice(0, 8))) return rec;
+        }
+        // Still ambiguous — return first unmatched candidate
+        return candidates[0];
+      }
+    }
+  }
+
+  // Strategy 4: Pure image message (no text) — match by timestamp proximity
+  const msgTime = msg.create_time ? new Date(msg.create_time).getTime() : 0;
+  if (msgTime > 0) {
+    let bestRec = null, bestDiff = Infinity;
+    for (const rec of baseRecords) {
+      if (rec.hasImage) continue;
+      const recTime = parseInt(rec.time) || 0;
+      const diff = Math.abs(msgTime - recTime);
+      // Within 5 minutes
+      if (diff < 300000 && diff < bestDiff) {
+        bestDiff = diff;
+        bestRec = rec;
+      }
+    }
+    if (bestRec) return bestRec;
   }
 
   return null;
@@ -299,7 +370,8 @@ async function main() {
     const record = findMatchingRecord(msg, baseRecords);
 
     if (!record) {
-      console.log(`    ⚠ No matching Base record found, skipping`);
+      const msgText = extractMessageText(msg).slice(0, 60);
+      console.log(`    ⚠ No match. Text: "${msgText}"`);
       skipped++;
       continue;
     }

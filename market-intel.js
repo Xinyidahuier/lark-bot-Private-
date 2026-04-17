@@ -5,9 +5,22 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const DB_PATH        = path.join(__dirname, 'market-intel-db.json');
-const CLAUDE_BIN     = process.platform === 'darwin'
-  ? `${process.env.HOME}/.npm/_npx/becf7b9e49303068/node_modules/.bin/claude`
-  : 'claude';
+
+// Robust Claude binary resolution: try 'claude' in PATH first, fallback to known npx location
+const CLAUDE_BIN     = (() => {
+  // On Linux server, 'claude' should be in PATH
+  if (process.platform !== 'darwin') return 'claude';
+  // On macOS dev, try 'claude' in PATH, fallback to npx cache
+  try {
+    const { execFileSync: efs } = require('child_process');
+    const p = efs('which', ['claude'], { encoding: 'utf8', timeout: 3000 }).trim();
+    if (p) return p;
+  } catch {}
+  // Fallback to known npx cache path (fragile, but better than nothing)
+  const npxPath = `${process.env.HOME}/.npm/_npx/becf7b9e49303068/node_modules/.bin/claude`;
+  if (fs.existsSync(npxPath)) return npxPath;
+  return 'claude';  // hope it's in PATH
+})();
 const LARK_CLI       = process.platform === 'darwin' ? '/opt/homebrew/bin/lark-cli' : 'lark-cli';
 const SHEET_TOKEN    = 'CzQJseP6OhchaKtHNjxc8VfqnEp';
 const SHEET_ID       = 'c54bde';
@@ -176,7 +189,7 @@ function loadHqFocus() {
 }
 
 function saveHqFocus(data) {
-  fs.writeFileSync(HQ_FOCUS_PATH, JSON.stringify(data, null, 2));
+  atomicWriteJSON(HQ_FOCUS_PATH, data);
 }
 
 /**
@@ -227,13 +240,42 @@ const CHILD_ENV = {
 };
 
 // ─────────────────────────────────────────────
+// Atomic file write helper (crash-safe)
+// ─────────────────────────────────────────────
+
+function atomicWriteJSON(filePath, data) {
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, filePath);
+}
+
+// ─────────────────────────────────────────────
 // DB helpers (JSON cache – fast dedup / digest)
 // ─────────────────────────────────────────────
 
 function loadDb() {
   try {
-    if (fs.existsSync(DB_PATH)) return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-  } catch {}
+    if (fs.existsSync(DB_PATH)) {
+      const raw = fs.readFileSync(DB_PATH, 'utf8');
+      const db = JSON.parse(raw);
+      // Guard: ensure entries is always an array
+      if (!db || !Array.isArray(db.entries)) return { entries: [] };
+      return db;
+    }
+  } catch (err) {
+    console.error('[market-intel] loadDb parse error (using empty db):', (err.message || '').slice(0, 100));
+    // Try to load from .tmp backup if main file is corrupt
+    try {
+      const tmpPath = DB_PATH + '.tmp';
+      if (fs.existsSync(tmpPath)) {
+        const db = JSON.parse(fs.readFileSync(tmpPath, 'utf8'));
+        if (db && Array.isArray(db.entries)) {
+          console.log('[market-intel] recovered db from .tmp backup');
+          return db;
+        }
+      }
+    } catch {}
+  }
   return { entries: [] };
 }
 
@@ -241,7 +283,7 @@ function saveDb(db) {
   // Keep only last 60 days in local cache
   const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
   db.entries = db.entries.filter(e => e.timestamp > cutoff);
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+  atomicWriteJSON(DB_PATH, db);
 }
 
 // Old Base snapshot — one-time export, no API calls needed
@@ -341,8 +383,12 @@ function extractField(row, fieldIndex, fieldName) {
   return val ? String(val) : '';
 }
 
-// Sync on module load
-syncFromBase();
+// Sync on module load — wrapped in try-catch so a Base API failure doesn't crash the import
+try {
+  syncFromBase();
+} catch (err) {
+  console.error('[market-intel] syncFromBase on load failed (non-fatal):', (err.message || '').slice(0, 200));
+}
 
 // ─────────────────────────────────────────────
 // Claude helper
@@ -357,7 +403,15 @@ function askClaude(prompt) {
     }).trim();
   } catch (err) {
     const out = (err.stdout || '').trim();
-    return out || null;
+    if (out) return out;
+    // Log specific error for debugging
+    const code = err.code || '';
+    if (code === 'ENOENT') {
+      console.error(`[market-intel] claude binary not found at: ${CLAUDE_BIN}`);
+    } else {
+      console.error('[market-intel] askClaude error:', (err.message || '').slice(0, 150));
+    }
+    return null;
   }
 }
 
@@ -427,30 +481,34 @@ function fillMissingBaseFields() {
   let data;
   try { data = JSON.parse(raw); } catch { return 0; }
 
+  if (!data || !data.data || !data.data.fields || !data.data.data || !data.data.record_id_list) {
+    console.error('[market-intel] base list returned unexpected structure');
+    return 0;
+  }
   const fields = data.data.fields;
   const records = data.data.data;
   const ids = data.data.record_id_list;
   const fi = {};
   fields.forEach((f, i) => fi[f] = i);
 
-  // Also try to read more pages to find the latest records
+  // Paginate through all records properly
   let allRecords = records.map((r, i) => ({ rec: r, id: ids[i] }));
 
-  // Check if there are more pages and get the last page
   if (data.data.has_more) {
-    // Get total by trying high offsets
-    for (const offset of [2000, 2200, 2400, 2600]) {
+    let offset = records.length;
+    const MAX_PAGES = 20; // safety limit: 20 pages * 200 = 4000 records max
+    for (let page = 0; page < MAX_PAGES; page++) {
       try {
-        const page = execFileSync(LARK_CLI, [
+        const pageOut = execFileSync(LARK_CLI, [
           'base', '+record-list',
           '--base-token', BASE_TOKEN,
           '--table-id',   BASE_TABLE_ID,
           '--offset', String(offset), '--limit', '200',
         ], { encoding: 'utf8', timeout: 30000, env: CHILD_ENV });
-        const pd = JSON.parse(page);
-        if (pd.data.data.length > 0) {
-          pd.data.data.forEach((r, i) => allRecords.push({ rec: r, id: pd.data.record_id_list[i] }));
-        }
+        const pd = JSON.parse(pageOut);
+        if (!pd.data || !pd.data.data || pd.data.data.length === 0) break;
+        pd.data.data.forEach((r, i) => allRecords.push({ rec: r, id: pd.data.record_id_list[i] }));
+        offset += pd.data.data.length;
         if (!pd.data.has_more) break;
       } catch { break; }
     }
@@ -558,7 +616,7 @@ function downloadImage(messageId, imageKey) {
   try {
     execFileSync(LARK_CLI, [
       'im', '+messages-resources-download',
-      '--as', 'bot',
+      '--as', 'user',
       '--message-id', messageId,
       '--file-key', imageKey,
       '--type', 'image',
@@ -574,22 +632,34 @@ function downloadImage(messageId, imageKey) {
 function analyzeImage(imagePath) {
   if (!imagePath || !fs.existsSync(imagePath)) return null;
   try {
-    const prompt = `Read the image file at ${imagePath} and analyze it. 这是泰国物流/快递行业的竞对情报图片（广告/价格表/海报）。请提取所有关键信息：品牌名、价格数字、重量阶梯、促销政策、服务内容。用中文简洁描述，150字以内。如果图片无法读取或不相关，回复"无"。`;
+    const prompt = `Read the image file at ${imagePath} and analyze it. 这是泰国物流/快递行业的竞对情报图片（广告/价格表/海报）。请提取所有关键信息：品牌名、价格数字、重量阶梯、促销政策、服务内容。用中文简洁描述，150字以内。
+
+重要：只提取图片上实际可见的数字和信息，不要猜测或编造任何价格、金额、重量等数字。如果图片模糊或某项信息不清晰，请标注"不清晰"而不是猜一个数字。如果图片无法读取或不相关，回复"无"。`;
 
     const result = execFileSync(CLAUDE_BIN, [
       '-p', prompt,
       '--output-format', 'text',
-      '--model', 'claude-opus-4-5',
+      '--model', 'claude-sonnet-4-20250514',
       '--allowedTools', 'Read',
       '--max-turns', '2',
-    ], { encoding: 'utf8', timeout: 60000 });
+    ], {
+      encoding: 'utf8',
+      timeout: 60000,
+      env: { ...process.env, FORCE_COLOR: '0', ANTHROPIC_API_KEY: '' },
+    });
 
     const text = (result || '').trim();
     if (!text || text === '无') return null;
     console.log(`[market-intel] image analyzed: ${text.slice(0, 80)}`);
     return text;
   } catch (err) {
-    console.error('[market-intel] image analysis error:', (err.message || '').slice(0, 100));
+    // Try to get stdout even on non-zero exit
+    const out = (err.stdout || '').trim();
+    if (out && out !== '无' && out.length > 5) {
+      console.log(`[market-intel] image analyzed (from stderr path): ${out.slice(0, 80)}`);
+      return out;
+    }
+    console.error('[market-intel] image analysis error:', (err.message || '').slice(0, 150));
     return null;
   }
 }
@@ -614,6 +684,8 @@ function upsertNewBaseRecord(intel, mark, messageId, timestamp, senderInfo) {
     '发送人':   senderInfo || '',
     '原文':     (intel.rawText || '').slice(0, 300),
     '模块':     intel.moduleTitle || '',
+    '待审查':   intel.needs_review || false,
+    '置信度':   intel.confidence || 'high',
   };
 
   try {
@@ -674,32 +746,35 @@ function extractIntel(text) {
 - 重点关注：价格战/补贴动向、网点争夺(加盟政策/套餐)、水果件竞争、COD/Drop Off费率、VIP价格、促销活动
 - 总部重点=会直接影响Flash Home定价策略或网点流失的重大情报
 
-严格过滤！只有以下情况才算情报(is_relevant=true)：
+所有消息都要记录！按置信度分类：
+- confidence="high"：有明确的价格/费率/政策/促销/加盟等具体信息
+- confidence="medium"：可能是情报但信息不完整（如图片看不清、只有部分内容、笼统描述）
+- confidence="low"：大概率不是情报（日常聊天、问候、感谢、内部协调），但仍然记录
+
+高置信度情报的特征：
 - 有具体的价格/费率数字（如起价XX฿、佣金X%、返利X฿/件）
 - 有明确的政策变动（新政策、取消、调整生效日期）
 - 有具体的竞对加盟/套餐方案细节
 - 有可验证的市场动向（某品牌进入/退出某区域、抢网点）
-- 有明确的服务策略（免费上门取件、免系统费、免退件费等，即使没有具体金额也算情报）
+- 有明确的服务策略（免费上门取件、免系统费、免退件费等）
 - 有促销活动详情（4.4/11.11大促、开业折扣、限时优惠等）
+- 黄牛/第三方平台代理Flash件的价格（如iShip/ShipHub代理Flash起价XX฿）也是高置信度情报
 
-以下不算情报(is_relevant=false)：
-- Flash/Flash Home/Flash Express 自身官方发布的信息（如Flash官方价格表、内部政策）。但如果是黄牛/第三方平台代理Flash件的价格（如iShip/ShipHub代理Flash起价XX฿），这属于黄牛情报，算is_relevant=true！
-- 日常聊天、问候、感谢、表情
-- 笼统的讨论/抱怨，没有具体数字或事实
-- 转发但无实质内容的消息
-- 已知的旧信息重复提及
-- 内部工作协调（排班、会议、系统操作指导）
+中置信度：图片内容模糊、只有品牌名没有细节、信息不完整但可能有价值
+
+低置信度：纯聊天、表情、感谢、内部协调、完全无关内容
 
 只输出JSON，不要其他内容：
 {
-  "brand": "品牌（Flash/KEX/SPX/J&T/DHL/BEST/邮政/MySave/ShipSmile/GoShip/Shippop/ShipHub/WeFast/SuperShip/DPlus/Postway等，如果是新品牌直接写品牌名，不要写'其他'）",
-  "category": "类别（价格调整/VIP价格/燃油附加费/加盟政策/网点套餐/促销活动/水果件/COD政策/Drop Off/补贴返利/系统功能/竞对动向/客户投诉/无关）",
-  "summary": "一句话中文摘要，20字以内",
+  "brand": "品牌（Flash/KEX/SPX/J&T/DHL/BEST/邮政/MySave/ShipSmile/GoShip/Shippop/ShipHub/WeFast/SuperShip/DPlus/Postway等，如果是新品牌直接写品牌名，不确定写'未知品牌'）",
+  "category": "类别（价格调整/VIP价格/燃油附加费/加盟政策/网点套餐/促销活动/水果件/COD政策/Drop Off/补贴返利/系统功能/竞对动向/客户投诉/待分类）",
+  "summary": "一句话中文摘要，20字以内，看不清内容写'图片内容待审查'",
   "amount": "金额或比例（如起价18฿、+2฿/件、COD 1.5%、返利3฿/件，无则null）",
   "effective_date": "生效日期（如4月20日，无则null）",
   "is_hq_priority": false,
-  "is_relevant": true或false,
-  "analysis": "50字以内中文，从Flash Home视角分析：①对Flash Home网点/客户的具体影响 ②建议关注点或应对方向。无关内容为null"
+  "confidence": "high/medium/low",
+  "needs_review": true或false（medium和low必须为true）,
+  "analysis": "50字以内中文，从Flash Home视角分析。low置信度写'待人工审查'"
 }
 
 消息：
@@ -777,6 +852,16 @@ ${existing}
 // ─────────────────────────────────────────────
 
 function processMessage(text, messageId, lookbackDays, { imageKeys, senderId, senderName } = {}) {
+  try {
+    return _processMessageInner(text, messageId, lookbackDays, { imageKeys, senderId, senderName });
+  } catch (err) {
+    console.error(`[market-intel] FATAL processMessage error for ${messageId}:`, err.message, (err.stack || '').slice(0, 300));
+    // Return a safe fallback so bot-server.js doesn't crash
+    return { skip: false, duplicate: false, isHqPriority: false, intel: null, mark: '❓' };
+  }
+}
+
+function _processMessageInner(text, messageId, lookbackDays, { imageKeys, senderId, senderName } = {}) {
   // Check if this is an HQ focus request (e.g. "请大家重点收集XXX")
   if (text && text.length >= 20) {
     const focusReq = detectFocusRequest(text);
@@ -796,9 +881,9 @@ function processMessage(text, messageId, lookbackDays, { imageKeys, senderId, se
     }
   }
 
-  // Skip very short messages and pure image captions (unless has images)
+  // Only skip truly empty messages (no text AND no images)
   const hasImages = imageKeys && imageKeys.length > 0;
-  if (!hasImages && (!text || text.trim().length < 20)) return { skip: true };
+  if (!hasImages && (!text || text.trim().length < 5)) return { skip: true };
 
   // Download images, analyze, and build context
   let imageContext = '';
@@ -820,11 +905,21 @@ function processMessage(text, messageId, lookbackDays, { imageKeys, senderId, se
   }
 
   const combinedText = ((text || '') + imageContext).trim() || '(图片消息)';
-  const intel = extractIntel(combinedText);
+  let intel = extractIntel(combinedText);
 
-  // Not relevant to logistics industry
-  if (!intel || !intel.is_relevant || intel.category === '无关') {
-    return { skip: true };
+  // AI extraction failed completely — still record with minimal info
+  if (!intel) {
+    intel = {
+      brand: '未知品牌', category: '待分类', summary: '内容待人工审查',
+      amount: null, effective_date: null, is_hq_priority: false,
+      confidence: 'low', needs_review: true, analysis: '待人工审查',
+    };
+  }
+
+  // Backward compat: convert old is_relevant format
+  if ('is_relevant' in intel && !('confidence' in intel)) {
+    intel.confidence = intel.is_relevant ? 'high' : 'low';
+    intel.needs_review = !intel.is_relevant;
   }
 
   const db        = loadDb();
@@ -835,8 +930,12 @@ function processMessage(text, messageId, lookbackDays, { imageKeys, senderId, se
   let mark;
   if (duplicate) {
     mark = '👀';
+  } else if (intel.needs_review || intel.confidence === 'low') {
+    mark = '❓';
   } else if (isHqFocus) {
     mark = '🔥';
+  } else if (intel.confidence === 'medium') {
+    mark = '⚠️';
   } else {
     mark = '✅';
   }
@@ -863,9 +962,13 @@ function processMessage(text, messageId, lookbackDays, { imageKeys, senderId, se
     resolvedName
   );
 
-  // Upload images to Base attachment field
+  // Upload images to Base attachment field, then clean up temp files
   if (downloadedImagePaths.length > 0 && recordId) {
     uploadImagesToBase(recordId, downloadedImagePaths);
+    // Clean up temp images after successful upload
+    for (const imgPath of downloadedImagePaths) {
+      try { if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath); } catch {}
+    }
   }
 
   // Append to AMBD sheet (市场信息-AMBD 2026) — only for new intel
@@ -908,7 +1011,9 @@ function getDailyDigest() {
   const nowBKK = new Date(Date.now() + 7 * 60 * 60 * 1000);
   const today  = nowBKK.toISOString().slice(0, 10);
 
-  const newEntries   = db.entries.filter(e => e.date === today && !e.duplicate && e.is_relevant !== false);
+  const allToday     = db.entries.filter(e => e.date === today && !e.duplicate);
+  const newEntries   = allToday.filter(e => e.confidence !== 'low');
+  const reviewCount  = allToday.filter(e => e.needs_review || e.confidence === 'low' || e.confidence === 'medium').length;
   const dupCount     = db.entries.filter(e => e.date === today && e.duplicate).length;
 
   if (newEntries.length === 0) {
@@ -933,7 +1038,7 @@ function getDailyDigest() {
   const hqItems = newEntries.filter(e => e.is_hq_priority);
 
   let digest = `📊 市场情报日报 ${today}\n`;
-  digest += `（新增 ${newEntries.length} 条 | 过滤重复 ${dupCount} 条）\n\n`;
+  digest += `（新增 ${newEntries.length} 条 | 过滤重复 ${dupCount} 条${reviewCount > 0 ? ` | 待审查 ${reviewCount} 条` : ''}）\n\n`;
   digest += sections;
 
   if (hqItems.length > 0) {
@@ -1063,4 +1168,153 @@ ${JSON.stringify(entriesJson, null, 0)}`;
   return report;
 }
 
-module.exports = { processMessage, getDailyDigest, getWeeklyReport, fillMissingBaseFields };
+// ─────────────────────────────────────────────
+// Weekly report as Feishu Doc
+// ─────────────────────────────────────────────
+
+function createWeeklyReportDoc() {
+  const nowBKK = new Date(Date.now() + 7 * 60 * 60 * 1000);
+
+  const dayOfWeek = nowBKK.getDay();
+  const mondayOffset = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  const monday = new Date(nowBKK);
+  monday.setDate(monday.getDate() - mondayOffset);
+  const mondayStr = monday.toISOString().slice(0, 10);
+  const todayStr  = nowBKK.toISOString().slice(0, 10);
+
+  // Format week label like "3月30日-4月4日"
+  const mStart = monday.getMonth() + 1;
+  const dStart = monday.getDate();
+  const mEnd   = nowBKK.getMonth() + 1;
+  const dEnd   = nowBKK.getDate();
+  const weekLabel = `${mStart}月${dStart}日-${mEnd}月${dEnd}日`;
+
+  // Read records from Base (same logic as getWeeklyReport)
+  let allRecords = [];
+  try {
+    let offset = 0;
+    while (true) {
+      const out = execFileSync(LARK_CLI, [
+        'base', '+record-list', '--as', 'bot',
+        '--base-token', NEW_BASE_TOKEN,
+        '--table-id', NEW_BASE_TABLE_ID,
+        '--limit', '200', '--offset', String(offset),
+      ], { encoding: 'utf8', timeout: 30000, env: CHILD_ENV });
+      const resp = JSON.parse(out);
+      const data = resp.data || {};
+      const fields = data.fields || [];
+      const rows = data.data || [];
+      if (!rows.length) break;
+      const fi = {};
+      fields.forEach((f, i) => { fi[f] = i; });
+      for (const row of rows) {
+        const get = (name) => {
+          const idx = fi[name];
+          if (idx === undefined || idx >= row.length) return '';
+          const v = row[idx];
+          if (Array.isArray(v)) return v[0] ? String(v[0]) : '';
+          return v ? String(v) : '';
+        };
+        allRecords.push({
+          brand: get('品牌'), category: get('类别'), summary: get('摘要'),
+          amount: get('金额'), time: get('发送时间'),
+          dup: get('是否重复'), priority: get('是否重点'), source: get('来源'),
+        });
+      }
+      if (!data.has_more) break;
+      offset += rows.length;
+    }
+  } catch (err) {
+    console.error('[market-intel] weekly doc Base read error:', (err.message || '').slice(0, 100));
+  }
+
+  // Filter this week's non-duplicate records
+  const weekEntries = allRecords.filter(e => {
+    const dateStr = (e.time || '').slice(0, 10);
+    return dateStr >= mondayStr && dateStr <= todayStr && !e.dup.includes('重复');
+  });
+
+  if (weekEntries.length === 0) {
+    return { url: null, message: `本周（${mondayStr} ~ ${todayStr}）无新情报，未生成周报文档。` };
+  }
+
+  // Build markdown table for 竞对信息更新
+  let tableRows = weekEntries.map(e => {
+    const date = (e.time || '').slice(0, 10);
+    const brand = (e.brand || '').replace(/\|/g, '/');
+    const cat = (e.category || '').replace(/\|/g, '/');
+    const summary = (e.summary || '').replace(/\|/g, '/').replace(/\n/g, ' ');
+    const amount = (e.amount || '').replace(/\|/g, '/');
+    const prio = e.priority.includes('重点') ? '是' : '';
+    return `| ${date} | ${brand} | ${cat} | ${summary} | ${amount} | ${prio} |`;
+  });
+
+  let md = `# 竞对黄牛周报 ${weekLabel}\n\n`;
+  md += `## 竞对信息更新\n\n`;
+  md += `| 日期 | 品牌 | 类别 | 摘要 | 金额 | 重点 |\n`;
+  md += `| --- | --- | --- | --- | --- | --- |\n`;
+  md += tableRows.join('\n') + '\n\n';
+
+  // Generate AI summary
+  const entriesJson = weekEntries.map(e => ({
+    brand: e.brand, category: e.category, summary: e.summary,
+    amount: e.amount || '', date: (e.time || '').slice(0, 10),
+  }));
+
+  const prompt = `你是Flash Home（Flash Express泰国加盟网点体系）的市场情报分析师。
+根据本周（${mondayStr} ~ ${todayStr}）收集的竞对和黄牛情报，写一段总结建议。
+
+要求：
+1. 分析本周市场整体趋势（价格战、补贴、加盟招商等）
+2. 重点分析对Flash Home的影响
+3. 给出2-3条具体建议行动
+4. 语言简洁专业，引用具体数字
+5. 不要用列表格式，用连贯的段落（2-3段）
+6. 总字数300-500字
+
+情报数据：
+${JSON.stringify(entriesJson, null, 0)}`;
+
+  const summary = askClaude(prompt) || '(总结生成失败)';
+
+  md += `## 总结建议\n\n${summary}\n\n`;
+  md += `---\n完整数据：[市场情报 Base](https://flashexpress-th.feishu.cn/base/${NEW_BASE_TOKEN}?table=${NEW_BASE_TABLE_ID})\n`;
+
+  // Create Feishu doc
+  const title = `竞对黄牛周报 ${weekLabel}`;
+  try {
+    const out = execFileSync(LARK_CLI, [
+      'docs', '+create',
+      '--title', title,
+      '--markdown', md,
+      '--as', 'bot',
+    ], { encoding: 'utf8', timeout: 30000, env: { ...CHILD_ENV, ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '' } });
+
+    // Parse doc URL from output
+    let docUrl = null;
+    try {
+      const resp = JSON.parse(out);
+      if (resp.ok && resp.data) {
+        docUrl = resp.data.doc_url || null;
+      }
+    } catch {
+      const urlMatch = out.match(/https:\/\/\S+\/docx\/\S+/);
+      if (urlMatch) docUrl = urlMatch[0];
+    }
+
+    if (docUrl) {
+      console.log(`[market-intel] weekly report doc created: ${docUrl}`);
+      return {
+        url: docUrl,
+        message: `📊 竞对黄牛周报 ${weekLabel}\n📈 新情报 ${weekEntries.length} 条 | 涉及 ${Object.keys(weekEntries.reduce((a, e) => { a[e.brand] = 1; return a; }, {})).length} 个品牌\n\n📄 完整报告：${docUrl}`,
+      };
+    }
+
+    return { url: null, message: `周报文档创建失败：${out.slice(0, 200)}` };
+  } catch (err) {
+    console.error('[market-intel] doc create error:', (err.message || '').slice(0, 100));
+    return { url: null, message: `周报文档创建失败：${(err.message || '').slice(0, 100)}` };
+  }
+}
+
+module.exports = { processMessage, getDailyDigest, getWeeklyReport, createWeeklyReportDoc, fillMissingBaseFields };

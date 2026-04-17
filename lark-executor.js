@@ -87,7 +87,7 @@ function fetchDoc(docUrl) {
 
 /** Search documents */
 function searchDocs(keyword) {
-  return run(['doc', '+search', '--keyword', keyword], { asUser: true });
+  return run(['docs', '+search', '--query', keyword], { asUser: true });
 }
 
 /** Get recent messages from a chat */

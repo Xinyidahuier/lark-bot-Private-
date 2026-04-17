@@ -33,18 +33,20 @@ if (!fs.existsSync(IMG_TEMP_DIR)) fs.mkdirSync(IMG_TEMP_DIR, { recursive: true }
 
 function fetchMessages(startDate, endDate) {
   const allMessages = [];
-  // Fetch day by day to avoid pagination issues
-  const start = new Date(startDate + 'T00:00:00+07:00');
-  const end   = new Date(endDate + 'T23:59:59+07:00');
 
-  let cursor = new Date(start);
-  while (cursor < end) {
-    const dayEnd = new Date(cursor);
-    dayEnd.setDate(dayEnd.getDate() + 1);
+  // Build list of days to fetch (Bangkok dates)
+  const days = [];
+  let d = new Date(startDate + 'T00:00:00Z');
+  const endD = new Date(endDate + 'T00:00:00Z');
+  while (d <= endD) {
+    days.push(d.toISOString().slice(0, 10));
+    d = new Date(d.getTime() + 86400000);
+  }
 
-    const startISO = cursor.toISOString().replace('Z', '+07:00');
-    const endISO   = dayEnd.toISOString().replace('Z', '+07:00');
-    const dateLabel = cursor.toISOString().slice(0, 10);
+  for (const dateLabel of days) {
+    // Construct Bangkok timezone ISO strings directly (no Date conversion bugs)
+    const startISO = `${dateLabel}T00:00:00.000+07:00`;
+    const endISO   = `${dateLabel}T23:59:59.000+07:00`;
 
     console.log(`[backfill] fetching messages for ${dateLabel}...`);
 
@@ -57,17 +59,16 @@ function fetchMessages(startDate, endDate) {
       ], { encoding: 'utf8', timeout: 30000, env: CHILD_ENV });
 
       const resp = JSON.parse(out);
-      const items = resp?.data?.items || [];
-      console.log(`  found ${items.length} messages`);
+      // lark-cli returns data.messages (not data.items)
+      const msgs = resp?.data?.messages || resp?.data?.items || [];
+      console.log(`  found ${msgs.length} messages`);
 
-      for (const msg of items) {
+      for (const msg of msgs) {
         allMessages.push(msg);
       }
     } catch (err) {
-      console.error(`  error fetching ${dateLabel}:`, (err.message || '').slice(0, 100));
+      console.error(`  error fetching ${dateLabel}:`, (err.stderr || err.message || '').slice(0, 200));
     }
-
-    cursor = dayEnd;
   }
 
   return allMessages;

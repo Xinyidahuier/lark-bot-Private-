@@ -93,10 +93,17 @@ function saveSentTracker(tracker) {
   try { atomicWriteJSON(SENT_TRACKER_FILE, tracker); } catch {}
 }
 
-// Direct path to cached claude-code binary
-const CLAUDE_BIN = process.platform === 'darwin'
-  ? `${process.env.HOME}/.npm/_npx/becf7b9e49303068/node_modules/.bin/claude`
-  : 'claude';
+// Robust Claude binary resolution
+const CLAUDE_BIN = (() => {
+  if (process.platform !== 'darwin') return 'claude';
+  try {
+    const p = execFileSync('which', ['claude'], { encoding: 'utf8', timeout: 3000 }).trim();
+    if (p) return p;
+  } catch {}
+  const npxPath = `${process.env.HOME}/.npm/_npx/becf7b9e49303068/node_modules/.bin/claude`;
+  if (fs.existsSync(npxPath)) return npxPath;
+  return 'claude';
+})();
 
 // ─────────────────────────────────────────────
 // Claude call — pure text Q&A, no tools
@@ -908,12 +915,34 @@ async function backfillMissedMessages() {
       const senderName = msg.sender ? msg.sender.name : '';
       const messageId = msg.message_id || '';
 
+      // Skip if already processed (persistent dedup)
+      if (messageId && processedMsgIds.has(messageId)) continue;
+      if (messageId) {
+        processedMsgIds.add(messageId);
+        if (processedMsgIds.size > 500) {
+          const first = processedMsgIds.values().next().value;
+          processedMsgIds.delete(first);
+        }
+        saveProcessedIds();
+      }
+
       // Extract image keys
       const imageKeys = [];
-      const imgMatches = content.matchAll(/\[Image:\s*(img_v3_\S+?)\]/g);
-      for (const m of imgMatches) imageKeys.push(m[1]);
+      // Pattern 1: [Image: img_v3_xxx] format
+      const imgTagMatches = content.matchAll(/\[Image:\s*(img_[^\]]+)\]/g);
+      for (const m of imgTagMatches) imageKeys.push(m[1].replace(/[\]\)"'\s]+$/, ''));
+      // Pattern 2: bare img_v3_ references
+      if (imageKeys.length === 0) {
+        const bare = content.match(/img_v3_\S+/g) || [];
+        imageKeys.push(...bare.map(k => k.replace(/[\]\)"'\s]+$/, '')));
+      }
+      // Pattern 3: pure image messages
+      if (msgType === 'image' && imageKeys.length === 0) {
+        const imgM = content.match(/img_\S+/g);
+        if (imgM) imageKeys.push(...imgM.map(k => k.replace(/[\]\)"'\s]+$/, '')));
+      }
 
-      const textOnly = content.replace(/\[Image:\s*img_v3_\S+?\]/g, '').trim();
+      const textOnly = content.replace(/\[Image:\s*[^\]]+\]/g, '').trim();
 
       const hasImages = imageKeys.length > 0;
       if (!hasImages && (!textOnly || textOnly.length < 20)) continue;
@@ -951,7 +980,7 @@ async function backfillMissedMessages() {
 // ─────────────────────────────────────────────
 // Periodic poll: safety net for dropped WebSocket events
 // ─────────────────────────────────────────────
-const POLL_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const POLL_INTERVAL = 2 * 60 * 1000; // 2 minutes — more aggressive polling as safety net
 
 async function pollMktGroup() {
   try {
@@ -999,11 +1028,22 @@ async function pollMktGroup() {
       const content = msg.content || '';
       const msgType = msg.msg_type || 'text';
 
-      // Build a lightweight event object compatible with handleMarketMessage
+      // Extract image keys from content
       const imageKeys = [];
-      const imgMatches = content.matchAll(/img_v3_\S+/g);
-      for (const m of imgMatches) imageKeys.push(m[0].replace(/[\]\)"]+$/, ''));
-      const textOnly = content.replace(/\[Image:\s*img_v3_\S+?\]/g, '').trim();
+      // Pattern 1: [Image: img_v3_xxx] format from lark-cli
+      const tagMatches = content.matchAll(/\[Image:\s*(img_[^\]]+)\]/g);
+      for (const m of tagMatches) imageKeys.push(m[1].replace(/[\]\)"'\s]+$/, ''));
+      // Pattern 2: bare img_v3_ references
+      if (imageKeys.length === 0) {
+        const bareMatches = content.matchAll(/img_v3_\S+/g);
+        for (const m of bareMatches) imageKeys.push(m[0].replace(/[\]\)"'\s]+$/, ''));
+      }
+      // Pattern 3: pure image messages
+      if (msgType === 'image' && imageKeys.length === 0) {
+        const imgMatch = content.match(/img_\S+/g);
+        if (imgMatch) imageKeys.push(...imgMatch.map(k => k.replace(/[\]\)"'\s]+$/, '')));
+      }
+      const textOnly = content.replace(/\[Image:\s*[^\]]+\]/g, '').trim();
       const hasImages = imageKeys.length > 0;
       if (!hasImages && (!textOnly || textOnly.length < 20)) continue;
 
@@ -1044,6 +1084,7 @@ let schedulersStarted = false;
 let lastEventTime = Date.now();
 let eventProc = null;
 let eventRl = null;  // readline interface reference for cleanup
+let eventRestartAttempts = 0;  // track consecutive restart failures
 const EVENT_WATCHDOG_INTERVAL = 10 * 60 * 1000; // 10 min
 const EVENT_STALE_THRESHOLD   = 30 * 60 * 1000; // 30 min without events → restart
 
@@ -1059,6 +1100,16 @@ function startEventListener() {
   cleanupEventListener(); // ensure no leftover from previous run
   console.log('[bot] Starting Feishu event listener...');
   lastEventTime = Date.now();
+
+  // Verify lark-cli exists before spawning
+  try {
+    execFileSync('which', ['lark-cli'], { encoding: 'utf8', timeout: 3000 });
+  } catch {
+    console.error('[bot] FATAL: lark-cli not found in PATH. Event listener cannot start.');
+    console.error('[bot] PATH:', process.env.PATH);
+    // Don't exit — poll-based fallback will still work
+    return;
+  }
 
   const proc = spawn('lark-cli', [
     'event', '+subscribe',
@@ -1078,12 +1129,29 @@ function startEventListener() {
     }
   });
 
-  proc.on('error', (err) => { console.error('[bot] spawn error:', err.message); process.exit(1); });
+  proc.on('error', (err) => {
+    // DON'T exit the process — just log and retry with backoff
+    console.error('[bot] spawn error:', err.message);
+    eventRestartAttempts++;
+    const delay = Math.min(5000 * Math.pow(2, eventRestartAttempts), 300000); // max 5 min
+    console.error(`[bot] will retry event listener in ${Math.round(delay/1000)}s (attempt ${eventRestartAttempts})`);
+    setTimeout(startEventListener, delay);
+  });
   proc.on('close', (code) => {
     eventProc = null;
     if (eventRl) { try { eventRl.close(); } catch {} eventRl = null; }
-    console.error(`[bot] lark-cli exited (${code}). Restarting event listener in 5s...`);
-    setTimeout(startEventListener, 5000);
+    if (code === 0) {
+      // Normal exit — likely killed by watchdog or signal, restart quickly
+      eventRestartAttempts = 0;
+      console.log(`[bot] lark-cli exited normally. Restarting event listener in 5s...`);
+      setTimeout(startEventListener, 5000);
+    } else {
+      // Error exit — apply backoff
+      eventRestartAttempts++;
+      const delay = Math.min(5000 * Math.pow(2, eventRestartAttempts), 300000);
+      console.error(`[bot] lark-cli exited (code ${code}). Restarting in ${Math.round(delay/1000)}s (attempt ${eventRestartAttempts})`);
+      setTimeout(startEventListener, delay);
+    }
   });
 
   const rl = readline.createInterface({ input: proc.stdout, crlfDelay: Infinity });
@@ -1092,6 +1160,7 @@ function startEventListener() {
     line = line.trim();
     if (!line) return;
     lastEventTime = Date.now();
+    eventRestartAttempts = 0; // reset backoff on successful data
     let event;
     try { event = JSON.parse(line); } catch { return; }
     if (event.type !== 'im.message.receive_v1') return;
@@ -1100,9 +1169,55 @@ function startEventListener() {
   });
 }
 
+function startupSelfTest() {
+  console.log('[selftest] Running startup checks...');
+  let ok = true;
+
+  // 1. Check lark-cli
+  try {
+    const ver = execFileSync('lark-cli', ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
+    console.log(`[selftest] lark-cli: ${ver}`);
+  } catch (err) {
+    console.error('[selftest] ✗ lark-cli not found or not working:', err.message?.slice(0, 80));
+    ok = false;
+  }
+
+  // 2. Check lark-cli auth (bot)
+  try {
+    const out = execFileSync('lark-cli', ['auth', 'status', '--as', 'bot'], { encoding: 'utf8', timeout: 5000 }).trim();
+    console.log(`[selftest] bot auth: ${out.slice(0, 80)}`);
+  } catch (err) {
+    console.error('[selftest] ✗ bot auth failed:', (err.stdout || err.message || '').slice(0, 80));
+  }
+
+  // 3. Check claude binary
+  try {
+    execFileSync(CLAUDE_BIN, ['--version'], { encoding: 'utf8', timeout: 5000 });
+    console.log(`[selftest] claude: OK (${CLAUDE_BIN})`);
+  } catch (err) {
+    console.error(`[selftest] ⚠ claude not available (${CLAUDE_BIN}): ${(err.message || '').slice(0, 60)}`);
+    console.error('[selftest]   (image analysis and AI features will not work)');
+  }
+
+  // 4. Check required files
+  const requiredFiles = ['config.js', 'market-intel.js', 'message-filter.js', 'conversation.js', 'lark-executor.js'];
+  for (const f of requiredFiles) {
+    if (!fs.existsSync(path.join(__dirname, f))) {
+      console.error(`[selftest] ✗ missing required file: ${f}`);
+      ok = false;
+    }
+  }
+
+  console.log(`[selftest] ${ok ? '✓ All critical checks passed' : '⚠ Some checks failed — bot may have limited functionality'}`);
+  return ok;
+}
+
 function start() {
   console.log(`[bot] Bot: ${config.botOpenId}`);
   console.log(`[market] Monitoring MKT group: ${MKT_GROUP_ID}`);
+
+  // Run self-test before starting
+  startupSelfTest();
 
   // Backfill missed messages from downtime
   backfillMissedMessages().catch(err => console.error('[backfill] error:', err.message));
@@ -1128,8 +1243,8 @@ function start() {
   }, POLL_INTERVAL);
   setTimeout(() => {
     pollMktGroup().catch(err => console.error('[poll] initial error:', err.message));
-  }, 60 * 1000);
-  console.log('[poll] MKT group polling started (every 5 min)');
+  }, 30 * 1000); // first poll 30s after startup
+  console.log('[poll] MKT group polling started (every 2 min)');
 
   // Watchdog: restart event listener if no events for 30 min
   setInterval(() => {
